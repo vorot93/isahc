@@ -6,46 +6,13 @@
 //! sent and/or HTTP responses after they are received.
 
 use crate::Body;
+use futures_core::future::LocalBoxFuture;
+use futures_util::future::{self, FutureExt};
 use http::{Request, Response};
-use std::convert::identity;
+use std::convert::{identity, TryFrom};
+use std::error::Error;
 
-/// Create a new _request_ middleware from a function.
-pub fn before(
-    f: impl Fn(Request<Body>) -> Request<Body> + Send + Sync + 'static,
-) -> impl Middleware {
-    create(f, identity)
-}
-
-/// Create a new _response_ middleware from a function.
-pub fn after(
-    f: impl Fn(Response<Body>) -> Response<Body> + Send + Sync + 'static,
-) -> impl Middleware {
-    create(identity, f)
-}
-
-/// Create a new middleware from a pair of functions.
-pub fn create(
-    request: impl Fn(Request<Body>) -> Request<Body> + Send + Sync + 'static,
-    response: impl Fn(Response<Body>) -> Response<Body> + Send + Sync + 'static,
-) -> impl Middleware {
-    struct Impl<F, G>(F, G);
-
-    impl<F, G> Middleware for Impl<F, G>
-    where
-        F: Fn(Request<Body>) -> Request<Body> + Send + Sync + 'static,
-        G: Fn(Response<Body>) -> Response<Body> + Send + Sync + 'static,
-    {
-        fn filter_request(&self, request: Request<Body>) -> Request<Body> {
-            (self.0)(request)
-        }
-
-        fn filter_response(&self, response: Response<Body>) -> Response<Body> {
-            (self.1)(response)
-        }
-    }
-
-    Impl(request, response)
-}
+pub type Result<'m, T> = LocalBoxFuture<'m, std::result::Result<T, Box<dyn Error>>>;
 
 /// Base trait for middleware.
 ///
@@ -54,12 +21,51 @@ pub fn create(
 /// in parallel.
 pub trait Middleware: Send + Sync + 'static {
     /// Transform a request before it is sent.
-    fn filter_request(&self, request: Request<Body>) -> Request<Body> {
-        request
+    fn before<'m>(&'m self, request: Request<Body>) -> Result<'m, BeforeAction> {
+        future::ok(request.into()).boxed_local()
     }
 
     /// Transform a response after it is received.
-    fn filter_response(&self, response: Response<Body>) -> Response<Body> {
-        response
+    fn after<'m>(&'m self, response: Response<Body>) -> Result<'m, Response<Body>> {
+        future::ok(response).boxed_local()
+    }
+}
+
+/// An action performed by middleware before sending a request.
+pub enum BeforeAction {
+    /// Continue performing the request. The request to perform is included, and
+    /// may differ from the original request.
+    Continue(Request<Body>),
+
+    /// Finish the request here with the given response. The request will not be
+    /// sent over the wire.
+    Break(Response<Body>),
+}
+
+impl BeforeAction {
+    pub(crate) fn into_request(self) -> Option<Request<Body>> {
+        match self {
+            BeforeAction::Continue(request) => Some(request),
+            BeforeAction::Break(_) => None,
+        }
+    }
+
+    pub(crate) fn into_response(self) -> Option<Response<Body>> {
+        match self {
+            BeforeAction::Continue(_) => None,
+            BeforeAction::Break(response) => Some(response),
+        }
+    }
+}
+
+impl From<Request<Body>> for BeforeAction {
+    fn from(request: Request<Body>) -> Self {
+        BeforeAction::Continue(request)
+    }
+}
+
+impl From<Response<Body>> for BeforeAction {
+    fn from(response: Response<Body>) -> Self {
+        BeforeAction::Break(response)
     }
 }

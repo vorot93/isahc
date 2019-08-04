@@ -4,10 +4,11 @@
 //!
 //! Everything in this module requires the `cookies` feature to be enabled.
 
-use crate::middleware::Middleware;
+use crate::middleware::{self, Middleware};
 use crate::Body;
 use chrono::prelude::*;
 use chrono::Duration;
+use futures_util::future::{self, FutureExt};
 use http::{Request, Response, Uri};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -267,18 +268,18 @@ impl CookieJar {
 }
 
 impl Middleware for CookieJar {
-    fn filter_request(&self, mut request: Request<Body>) -> Request<Body> {
+    fn before(&self, mut request: Request<Body>) -> middleware::Result<'_, middleware::BeforeAction> {
         if let Some(header) = self.get_cookies(request.uri()) {
             request
                 .headers_mut()
                 .insert(http::header::COOKIE, header.parse().unwrap());
         }
 
-        request
+        future::ok(request.into()).boxed_local()
     }
 
     /// Extracts cookies set via the Set-Cookie header.
-    fn filter_response(&self, response: Response<Body>) -> Response<Body> {
+    fn after(&self, response: Response<Body>) -> middleware::Result<'_, Response<Body>> {
         if response.headers().contains_key(http::header::SET_COOKIE) {
             let cookies = response
                 .headers()
@@ -300,13 +301,14 @@ impl Middleware for CookieJar {
             self.add(cookies);
         }
 
-        response
+        future::ok(response).boxed_local()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::task::Join;
 
     fn parse_cookie(header: &str, uri: &str) -> Option<Cookie> {
         Cookie::parse(header, &uri.parse().unwrap())
@@ -393,21 +395,24 @@ mod tests {
         let uri: Uri = "https://example.com/foo".parse().unwrap();
         let jar = CookieJar::default();
 
-        jar.filter_response(
-            http::Response::builder()
+        jar.after(http::Response::builder()
                 .header(http::header::SET_COOKIE, "foo=bar")
                 .header(http::header::SET_COOKIE, "baz=123")
                 .extension(uri.clone())
                 .body(crate::Body::default())
-                .unwrap(),
-        );
+                .unwrap())
+            .join()
+            .unwrap();
 
-        let request = jar.filter_request(
-            http::Request::builder()
+        let request = jar
+            .before(http::Request::builder()
                 .uri(uri)
                 .body(crate::Body::default())
-                .unwrap(),
-        );
+                .unwrap())
+            .join()
+            .unwrap()
+            .into_request()
+            .unwrap();
 
         assert_eq!(request.headers()[http::header::COOKIE], "baz=123; foo=bar");
     }
